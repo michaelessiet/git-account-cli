@@ -185,6 +185,119 @@ func getAllAccountNames() ([]string, error) {
 	return names, nil
 }
 
+func includeFilePath(name string) string {
+	return expandPath(filepath.Join(accountsConfigDir, fmt.Sprintf("%s.gitconfig", name)))
+}
+
+func writeAccountIncludeFile(account *Account) error {
+	path := includeFilePath(account.Name)
+	content := fmt.Sprintf("[user]\n\tname = %s\n\temail = %s\n[core]\n\tsshCommand = ssh -i %s -o IdentitiesOnly=yes\n",
+		account.Name, account.Email, account.SSHKeyPath)
+	if err := ioutil.WriteFile(path, []byte(content), 0600); err != nil {
+		return fmt.Errorf("failed to write account include file: %w", err)
+	}
+	return nil
+}
+
+func absBindPath(p string) (string, error) {
+	abs, err := filepath.Abs(expandPath(p))
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve path: %w", err)
+	}
+	if !strings.HasSuffix(abs, "/") {
+		abs += "/"
+	}
+	return abs, nil
+}
+
+func includeIfKey(bindPath string) string {
+	return fmt.Sprintf("includeIf.gitdir:%s.path", bindPath)
+}
+
+func getDirectoryBindings() (map[string]string, error) {
+	output, err := runCmd("git", "config", "--global", "--get-regexp", `^includeif\.gitdir:.*\.path$`)
+	if err != nil {
+		// Exit code 1 means no matching keys, which is fine.
+		return map[string]string{}, nil
+	}
+	bindings := map[string]string{}
+	for _, line := range strings.Split(output, "\n") {
+		parts := strings.SplitN(line, " ", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key, value := parts[0], parts[1]
+		const prefix = "includeif.gitdir:"
+		const suffix = ".path"
+		if !strings.HasPrefix(key, prefix) || !strings.HasSuffix(key, suffix) {
+			continue
+		}
+		boundPath := key[len(prefix) : len(key)-len(suffix)]
+		name := strings.TrimSuffix(filepath.Base(value), ".gitconfig")
+		bindings[boundPath] = name
+	}
+	return bindings, nil
+}
+
+func useAccountForDirectory(name, path string) {
+	account, err := loadAccountConfig(name)
+	if err != nil {
+		fmt.Printf("Error loading account config: %v\n", err)
+		return
+	}
+	if account == nil {
+		fmt.Printf("Error: Account '%s' not found. Use 'git-account list' to see available accounts.\n", name)
+		return
+	}
+
+	bindPath, err := absBindPath(path)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	if info, err := os.Stat(strings.TrimSuffix(bindPath, "/")); err != nil {
+		fmt.Printf("Error: directory %s does not exist.\n", bindPath)
+		return
+	} else if !info.IsDir() {
+		fmt.Printf("Error: %s is not a directory.\n", bindPath)
+		return
+	}
+
+	if err := writeAccountIncludeFile(account); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	if _, err := runCmd("git", "config", "--global", "--replace-all", includeIfKey(bindPath), includeFilePath(account.Name)); err != nil {
+		fmt.Printf("Error setting includeIf in global gitconfig: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Bound %s (and subdirectories) to account '%s'.\n", bindPath, name)
+	fmt.Printf("Inside this tree, git will use:\n")
+	fmt.Printf("  user.name  = %s\n", account.Name)
+	fmt.Printf("  user.email = %s\n", account.Email)
+	fmt.Printf("  ssh key    = %s\n", account.SSHKeyPath)
+}
+
+func unuseDirectory(path string) {
+	bindPath, err := absBindPath(path)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+	key := includeIfKey(bindPath)
+	if _, err := runCmd("git", "config", "--global", "--get", key); err != nil {
+		fmt.Printf("No binding found for %s.\n", bindPath)
+		return
+	}
+	if _, err := runCmd("git", "config", "--global", "--unset-all", key); err != nil {
+		fmt.Printf("Error removing binding: %v\n", err)
+		return
+	}
+	fmt.Printf("Unbound %s.\n", bindPath)
+}
+
 func getPublicKeyContent(keyPath string) (string, error) {
 	publicKeyPath := fmt.Sprintf("%s.pub", keyPath)
 	content, err := ioutil.ReadFile(publicKeyPath)
@@ -373,6 +486,24 @@ func removeAccount(name string) {
 		os.Remove(configFilePath)
 		fmt.Printf("Removed account configuration for '%s'.\n", name)
 	}
+
+	// Remove per-account gitconfig include file
+	incPath := includeFilePath(name)
+	if _, err := os.Stat(incPath); err == nil {
+		os.Remove(incPath)
+		fmt.Printf("Removed gitconfig include: %s\n", incPath)
+	}
+
+	// Remove any directory bindings that pointed at this account
+	bindings, _ := getDirectoryBindings()
+	for boundPath, boundName := range bindings {
+		if boundName == name {
+			if _, err := runCmd("git", "config", "--global", "--unset-all", includeIfKey(boundPath)); err == nil {
+				fmt.Printf("Removed directory binding: %s\n", boundPath)
+			}
+		}
+	}
+
 	fmt.Printf("Account '%s' removed successfully.\n", name)
 }
 
@@ -436,6 +567,14 @@ func listAccounts() {
 		}
 	}
 
+	bindings, err := getDirectoryBindings()
+	if err == nil && len(bindings) > 0 {
+		fmt.Println("\n--- Directory Bindings ---")
+		for path, account := range bindings {
+			fmt.Printf("- %s -> %s\n", path, account)
+		}
+	}
+
 	fmt.Println("\n--- Current Global Git User ---")
 	currentName, err := runCmd("git", "config", "--global", "user.name")
 	if err != nil {
@@ -455,12 +594,16 @@ func displayHelp() {
 	fmt.Println("  add <name> <email> <type>      Add a new Git account (type: github, gitlab, bitbucket)")
 	fmt.Println("  remove <name>                  Remove an existing Git account")
 	fmt.Println("  switch <name>                  Switch to a configured Git account (sets global user.name/email)")
-	fmt.Println("  list                           List all configured Git accounts")
+	fmt.Println("  use <name> [path]              Bind <path> (default: cwd) and its subdirectories to <name>")
+	fmt.Println("  unuse [path]                   Remove the binding for <path> (default: cwd)")
+	fmt.Println("  list                           List all configured Git accounts and directory bindings")
 	fmt.Println("  help                           Display this help message")
 	fmt.Println("\nExamples:")
 	fmt.Println("  git-account add personal_github personal@example.com github")
 	fmt.Println("  git-account add work_bitbucket work@example.com bitbucket")
 	fmt.Println("  git-account switch personal_github")
+	fmt.Println("  git-account use work_bitbucket ~/code/work")
+	fmt.Println("  git-account unuse ~/code/work")
 	fmt.Println("  git-account list")
 	fmt.Println("\nNote: SSH keys are generated without a passphrase for convenience.")
 	fmt.Println("      Remember to add the generated public keys to your Git service settings.")
@@ -515,6 +658,34 @@ func main() {
 			switchAccount(os.Args[2])
 		} else {
 			fmt.Println("Usage: git-account switch <name>")
+		}
+	case "use":
+		switch len(os.Args) {
+		case 3:
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Printf("Error getting current directory: %v\n", err)
+				return
+			}
+			useAccountForDirectory(os.Args[2], cwd)
+		case 4:
+			useAccountForDirectory(os.Args[2], os.Args[3])
+		default:
+			fmt.Println("Usage: git-account use <name> [path]")
+		}
+	case "unuse":
+		switch len(os.Args) {
+		case 2:
+			cwd, err := os.Getwd()
+			if err != nil {
+				fmt.Printf("Error getting current directory: %v\n", err)
+				return
+			}
+			unuseDirectory(cwd)
+		case 3:
+			unuseDirectory(os.Args[2])
+		default:
+			fmt.Println("Usage: git-account unuse [path]")
 		}
 	case "list":
 		listAccounts()

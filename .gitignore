@@ -1,0 +1,8 @@
+# Local build outputs
+/git-account
+/git-account-cli
+
+# Go
+*.exe
+*.test
+*.out
