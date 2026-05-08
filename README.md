@@ -30,6 +30,7 @@ git-account <command> [args]
 | `use <name> [path]` | Bind a directory (default: cwd) and its subdirectories to an account. Inside the tree, git auto-applies that account's identity and SSH key. |
 | `unuse [path]` | Remove the binding for a directory (default: cwd). |
 | `list` | Show all configured accounts, directory bindings, and the current global Git identity. |
+| `rename <old> <new>` | Rename an existing account. Renames the SSH key pair, updates the SSH config host alias (`<host>-<new>`), per-account include file, and any directory bindings. Email and type are unchanged. Existing clone URLs that referenced the old host alias must be updated. |
 | `remove <name>` | Delete the account: SSH key pair, SSH config block, saved metadata, and any directory bindings pointing at it. |
 | `help` | Print the help text. |
 

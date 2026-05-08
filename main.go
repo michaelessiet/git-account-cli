@@ -538,6 +538,159 @@ func switchAccount(name string) {
 	fmt.Printf("Remember to use 'git clone git@%s:<owner>/<repo>.git' for new repos.\n", account.HostAlias)
 }
 
+func renameAccount(oldName, newName string) {
+	if oldName == newName {
+		fmt.Println("Error: old and new names are the same.")
+		return
+	}
+	if newName == "" || strings.ContainsAny(newName, "/\\ \t") {
+		fmt.Println("Error: new name cannot be empty or contain whitespace or path separators.")
+		return
+	}
+
+	oldAcc, err := loadAccountConfig(oldName)
+	if err != nil {
+		fmt.Printf("Error loading account config: %v\n", err)
+		return
+	}
+	if oldAcc == nil {
+		fmt.Printf("Error: Account '%s' not found.\n", oldName)
+		return
+	}
+
+	if existing, err := loadAccountConfig(newName); err != nil {
+		fmt.Printf("Error checking new name: %v\n", err)
+		return
+	} else if existing != nil {
+		fmt.Printf("Error: Account '%s' already exists.\n", newName)
+		return
+	}
+
+	newSSHKeyPath := expandPath(filepath.Join(sshDir, fmt.Sprintf("id_ed25519_%s", newName)))
+	if _, err := os.Stat(newSSHKeyPath); err == nil {
+		fmt.Printf("Error: SSH key '%s' already exists; refusing to overwrite.\n", newSSHKeyPath)
+		return
+	}
+
+	newHostAlias := fmt.Sprintf("%s-%s", oldAcc.Hostname, newName)
+
+	// Detect "currently switched to this account" so we can update global user.name afterward.
+	wasSwitched := false
+	if currentName, err := runCmd("git", "config", "--global", "user.name"); err == nil && currentName == oldAcc.Name {
+		if currentEmail, err2 := runCmd("git", "config", "--global", "user.email"); err2 == nil && currentEmail == oldAcc.Email {
+			wasSwitched = true
+		}
+	}
+
+	oldKeyPath := oldAcc.SSHKeyPath
+	if _, err := os.Stat(oldKeyPath); err == nil {
+		if err := os.Rename(oldKeyPath, newSSHKeyPath); err != nil {
+			fmt.Printf("Error renaming SSH private key: %v\n", err)
+			return
+		}
+		fmt.Printf("Renamed SSH key: %s -> %s\n", oldKeyPath, newSSHKeyPath)
+	}
+	oldPub := oldKeyPath + ".pub"
+	newPub := newSSHKeyPath + ".pub"
+	if _, err := os.Stat(oldPub); err == nil {
+		if err := os.Rename(oldPub, newPub); err != nil {
+			fmt.Printf("Error renaming SSH public key: %v\n", err)
+			return
+		}
+		fmt.Printf("Renamed SSH public key: %s -> %s\n", oldPub, newPub)
+	}
+
+	oldHostAlias := oldAcc.HostAlias
+	sshConfigFilePath := expandPath(sshConfigPath)
+	if content, err := ioutil.ReadFile(sshConfigFilePath); err == nil {
+		var newContent []string
+		scanner := bufio.NewScanner(strings.NewReader(string(content)))
+		skipLines := false
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.TrimSpace(line) == fmt.Sprintf("Host %s", oldHostAlias) {
+				skipLines = true
+			}
+			if !skipLines {
+				newContent = append(newContent, line)
+			}
+			if skipLines && strings.TrimSpace(line) == "" {
+				skipLines = false
+			}
+		}
+		if err := ioutil.WriteFile(sshConfigFilePath, []byte(strings.Join(newContent, "\n")), 0600); err != nil {
+			fmt.Printf("Warning: failed to rewrite SSH config: %v\n", err)
+		}
+	}
+
+	newAcc := &Account{
+		Name:       newName,
+		Email:      oldAcc.Email,
+		Type:       oldAcc.Type,
+		SSHKeyPath: newSSHKeyPath,
+		HostAlias:  newHostAlias,
+		Hostname:   oldAcc.Hostname,
+		User:       oldAcc.User,
+	}
+	if err := addSSHConfigEntry(newAcc); err != nil {
+		fmt.Printf("Warning: failed to add new SSH config entry: %v\n", err)
+	}
+
+	if err := saveAccountConfig(newAcc); err != nil {
+		fmt.Printf("Error saving new account config: %v\n", err)
+		return
+	}
+	oldIniPath := expandPath(filepath.Join(accountsConfigDir, fmt.Sprintf("%s.ini", oldName)))
+	if err := os.Remove(oldIniPath); err != nil && !os.IsNotExist(err) {
+		fmt.Printf("Warning: failed to remove old account config: %v\n", err)
+	}
+
+	oldIncPath := includeFilePath(oldName)
+	hadInclude := false
+	if _, err := os.Stat(oldIncPath); err == nil {
+		hadInclude = true
+		os.Remove(oldIncPath)
+	}
+	if hadInclude {
+		if err := writeAccountIncludeFile(newAcc); err != nil {
+			fmt.Printf("Warning: failed to write new include file: %v\n", err)
+		}
+	}
+
+	bindings, _ := getDirectoryBindings()
+	for boundPath, boundName := range bindings {
+		if boundName != oldName {
+			continue
+		}
+		if !hadInclude {
+			if err := writeAccountIncludeFile(newAcc); err != nil {
+				fmt.Printf("Warning: failed to write include file for binding %s: %v\n", boundPath, err)
+				continue
+			}
+			hadInclude = true
+		}
+		if _, err := runCmd("git", "config", "--global", "--replace-all", includeIfKey(boundPath), includeFilePath(newName)); err != nil {
+			fmt.Printf("Warning: failed to update directory binding for %s: %v\n", boundPath, err)
+		} else {
+			fmt.Printf("Updated directory binding: %s -> %s\n", boundPath, newName)
+		}
+	}
+
+	_, _ = runCmd("ssh-add", "-d", oldKeyPath)
+	addKeyToSSHAgent(newSSHKeyPath)
+
+	if wasSwitched {
+		if _, err := runCmd("git", "config", "--global", "user.name", newName); err != nil {
+			fmt.Printf("Warning: failed to update global user.name: %v\n", err)
+		} else {
+			fmt.Printf("Updated global git user.name to: %s\n", newName)
+		}
+	}
+
+	fmt.Printf("\nAccount '%s' renamed to '%s'.\n", oldName, newName)
+	fmt.Printf("Note: clone URLs using the old host alias 'git@%s:...' must be updated to 'git@%s:...'.\n", oldHostAlias, newHostAlias)
+}
+
 func listAccounts() {
 	names, err := getAllAccountNames()
 	if err != nil {
@@ -593,6 +746,7 @@ func displayHelp() {
 	fmt.Println("\nCommands:")
 	fmt.Println("  add <name> <email> <type>      Add a new Git account (type: github, gitlab, bitbucket)")
 	fmt.Println("  remove <name>                  Remove an existing Git account")
+	fmt.Println("  rename <old> <new>             Rename an existing account (keeps email and type)")
 	fmt.Println("  switch <name>                  Switch to a configured Git account (sets global user.name/email)")
 	fmt.Println("  use <name> [path]              Bind <path> (default: cwd) and its subdirectories to <name>")
 	fmt.Println("  unuse [path]                   Remove the binding for <path> (default: cwd)")
@@ -652,6 +806,12 @@ func main() {
 			removeAccount(os.Args[2])
 		} else {
 			fmt.Println("Usage: git-account remove <name>")
+		}
+	case "rename":
+		if len(os.Args) == 4 {
+			renameAccount(os.Args[2], os.Args[3])
+		} else {
+			fmt.Println("Usage: git-account rename <old> <new>")
 		}
 	case "switch":
 		if len(os.Args) == 3 {
